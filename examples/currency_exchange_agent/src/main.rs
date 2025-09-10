@@ -1,151 +1,223 @@
-use anyhow::Result;
-use chrono::Local;
-use colored::*;
-use reqwest::Client;
-use serde_json::Value;
-use std::io::{self, Write};
+use clap::Parser;
+use monitor::{CurrencyMonitor, MonitoringConfig};
+use std::sync::Arc;
 
-fn get_user_input(prompt: &str) -> Result<String> {
-    print!("{}", prompt);
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
+mod advanced_tools;
+mod agent;
+mod api;
+mod error_test;
+mod interactive;
+mod monitor;
+
+use autoagents::{
+    core::error::Error,
+    llm::{
+        backends::{anthropic::Anthropic, ollama::Ollama, openai::OpenAI},
+        builder::LLMBuilder,
+        LLMProvider,
+    },
+};
+
+// Command line arguments
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// LLM provider to use (openai, anthropic, ollama)
+    #[arg(
+        short = 'l',
+        long = "llm",
+        default_value = "openai",
+        help = "LLM provider: openai, anthropic, or ollama"
+    )]
+    llm: String,
+
+    /// Model name to use
+    #[arg(
+        short,
+        long,
+        help = "Model name (e.g., gpt-4o-mini, claude-3-sonnet, llama2)"
+    )]
+    model: Option<String>,
+
+    /// Interactive mode (default) or single query mode
+    #[arg(short, long, help = "Run in interactive chat mode")]
+    interactive: bool,
+
+    /// Single query for non-interactive mode
+    #[arg(short, long, help = "Single query to process")]
+    query: Option<String>,
+
+    /// Monitor mode - continuously watch currency rates and make trading suggestions
+    #[arg(long, help = "Run in autonomous monitoring mode")]
+    monitor: bool,
+
+    /// Initial investment amount for monitoring mode
+    #[arg(long, help = "Initial investment amount (required for monitor mode)")]
+    initial_amount: Option<f64>,
+
+    /// Initial currency for monitoring mode
+    #[arg(
+        long,
+        help = "Initial currency code (e.g., USD, EUR) for monitoring mode"
+    )]
+    initial_currency: Option<String>,
+
+    /// Monitoring interval in seconds
+    #[arg(
+        long,
+        default_value = "60",
+        help = "Monitoring interval in seconds (default: 60)"
+    )]
+    interval: u64,
+
+    /// Run error handling tests
+    #[arg(
+        long,
+        help = "Run error handling tests to verify user-friendly messages"
+    )]
+    test_errors: bool,
 }
 
-fn get_today_date() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
-}
-
-fn validate_date_format(date: &str) -> bool {
-    // Check if date matches YYYY-MM-DD format
-    if date.len() != 10 {
-        return false;
-    }
-
-    let parts: Vec<&str> = date.split('-').collect();
-    if parts.len() != 3 {
-        return false;
-    }
-
-    // Check if year, month, day are valid numbers
-    if let (Ok(year), Ok(month), Ok(day)) = (
-        parts[0].parse::<u32>(),
-        parts[1].parse::<u32>(),
-        parts[2].parse::<u32>(),
-    ) {
-        year >= 1999 && year <= 2026 && month >= 1 && month <= 12 && day >= 1 && day <= 31
-    } else {
-        false
+fn create_llm(provider: &str, model: Option<String>) -> Result<Arc<dyn LLMProvider>, Error> {
+    match provider.to_lowercase().as_str() {
+        "openai" => {
+            let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+                Error::CustomError("OPENAI_API_KEY environment variable not set".to_string())
+            })?;
+            let model = model.unwrap_or_else(|| "gpt-4o-mini".to_string());
+            let llm = LLMBuilder::<OpenAI>::new()
+                .api_key(&api_key)
+                .model(&model)
+                .build()
+                .map_err(|e| Error::CustomError(format!("Failed to create OpenAI LLM: {}", e)))?;
+            Ok(llm)
+        }
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+                Error::CustomError("ANTHROPIC_API_KEY environment variable not set".to_string())
+            })?;
+            let model = model.unwrap_or_else(|| "claude-3-sonnet-20240229".to_string());
+            let llm = LLMBuilder::<Anthropic>::new()
+                .api_key(&api_key)
+                .model(&model)
+                .build()
+                .map_err(|e| {
+                    Error::CustomError(format!("Failed to create Anthropic LLM: {}", e))
+                })?;
+            Ok(llm)
+        }
+        "ollama" => {
+            let model = model.unwrap_or_else(|| "llama2".to_string());
+            let llm = LLMBuilder::<Ollama>::new()
+                .model(&model)
+                .build()
+                .map_err(|e| Error::CustomError(format!("Failed to create Ollama LLM: {}", e)))?;
+            Ok(llm)
+        }
+        _ => Err(Error::CustomError(format!(
+            "Unsupported LLM provider: {}",
+            provider
+        ))),
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Get API key from environment variable
-    let api_key =
-        std::env::var("EXCHANGE_API_KEY").expect("EXCHANGE_API_KEY environment variable not set");
+async fn main() -> Result<(), Error> {
+    // Parse command line arguments
+    let args = Args::parse();
 
-    println!(
-        "{}",
-        "Interactive Currency Exchange Rate Fetcher".green().bold()
-    );
-    println!("Get historical exchange rates for any date ranging from 1999 to today!\n");
+    // Handle different modes
+    if args.test_errors {
+        // Run error handling tests (skip API key validation for tests)
+        println!("🧪 Running Error Handling Tests for Currency Exchange Agent");
+        println!("===========================================================\n");
 
-    // Get today's date as default
-    let today = get_today_date();
-
-    // Get date input from user
-    let date = loop {
-        let prompt = format!(
-            "Enter date (YYYY-MM-DD format) or press Enter for today [{}]: ",
-            today
-        );
-        let input = get_user_input(&prompt)?;
-
-        // If input is empty, use today's date
-        let date_to_validate = if input.is_empty() {
-            today.clone()
-        } else {
-            input
-        };
-
-        if validate_date_format(&date_to_validate) {
-            break date_to_validate;
-        } else {
-            println!(
-                "{}",
-                "Invalid date format! Please use YYYY-MM-DD format (e.g., 2024-01-15)".red()
-            );
-        }
-    };
-
-    println!(
-        "\n{}",
-        format!("Fetching exchange rates for {}...", date).cyan()
-    );
-
-    // Create HTTP client
-    let client = Client::new();
-
-    // Build the API URL for historical data with corrected format
-    let url = format!(
-        "https://api.exchangeratesapi.io/v1/{}?access_key={}&base=EUR&symbols=USD,GBP,EUR,INR,JPY",
-        date, api_key
-    );
-
-    // Make the API request
-    let response = client.get(&url).send().await?;
-
-    // Check if the request was successful
-    if response.status().is_success() {
-        let data: Value = response.json().await?;
-
-        // Check if the API returned an error
-        if let Some(error) = data.get("error") {
-            println!("{}", format!("API Error: {}", error).red());
-            if let Some(error_info) = data.get("error").and_then(|e| e.get("info")) {
-                println!("{}", format!("Details: {}", error_info).red());
+        match error_test::ErrorHandlingTest::run_all_tests().await {
+            Ok(()) => {
+                println!("\n🎉 All error handling tests completed successfully!");
+                println!("✨ The currency exchange agent provides user-friendly error messages.");
             }
-            return Ok(());
-        }
-
-        // Extract and display the exchange rates
-        println!("\n{}", "Historical Exchange Rates".cyan().bold());
-        println!(
-            "{}",
-            format!("Base Currency: {}", data["base"].as_str().unwrap_or("EUR")).yellow()
-        );
-        println!(
-            "{}",
-            format!("Date: {}", data["date"].as_str().unwrap_or("Unknown")).yellow()
-        );
-
-        if let Some(rates) = data.get("rates").and_then(|r| r.as_object()) {
-            println!("\n{}", "Exchange Rates:".cyan());
-            for (currency, rate) in rates {
-                println!("1 EUR = {:.4} {}", rate.as_f64().unwrap_or(0.0), currency);
+            Err(e) => {
+                eprintln!("\n❌ Error handling tests failed: {}", e);
+                std::process::exit(1);
             }
-        } else {
-            println!("{}", "No rates data found in the response".red());
         }
+        return Ok(());
+    }
 
-        // Note about the API
-        println!(
-            "\n{}",
-            "Note: Historical data shows exchange rates from EUR to other currencies.".yellow()
-        );
+    // Validate that ALPHA_VANTAGE_API_KEY is set (for normal operations)
+    if std::env::var("ALPHA_VANTAGE_API_KEY").is_err() {
+        eprintln!("❌ Error: ALPHA_VANTAGE_API_KEY environment variable not set.");
+        eprintln!("📋 To fix this:");
+        eprintln!("   1. Get a free API key from: https://www.alphavantage.co/support/#api-key");
+        eprintln!("   2. Set the environment variable:");
+        eprintln!("      export ALPHA_VANTAGE_API_KEY=\"your-api-key-here\"");
+        eprintln!("   3. Run the command again");
+        eprintln!();
+        eprintln!("💡 The Alpha Vantage API provides professional-grade forex data and technical indicators.");
+        std::process::exit(1);
+    }
+
+    // Create LLM provider
+    let llm = create_llm(&args.llm, args.model)?;
+
+    // Handle different modes
+    if args.monitor {
+        // Monitoring mode - autonomous currency monitoring
+        let initial_amount = args.initial_amount.ok_or_else(|| {
+            Error::CustomError("--initial-amount is required for monitor mode".to_string())
+        })?;
+        let initial_currency = args.initial_currency.ok_or_else(|| {
+            Error::CustomError("--initial-currency is required for monitor mode".to_string())
+        })?;
+
+        run_monitoring_mode(llm, initial_amount, initial_currency, args.interval).await?;
+    } else if let Some(query) = args.query {
+        // Single query mode
+        interactive::run_single_query(llm, query).await?;
     } else {
-        println!(
-            "{}",
-            format!("API request failed with status: {}", response.status()).red()
-        );
+        // Interactive mode (default)
+        interactive::run_interactive_session(llm).await?;
+    }
 
-        // Try to get error details from response body
-        if let Ok(error_text) = response.text().await {
-            println!("{}", format!("Error details: {}", error_text).red());
+    Ok(())
+}
+
+async fn run_monitoring_mode(
+    llm: Arc<dyn LLMProvider>,
+    initial_amount: f64,
+    initial_currency: String,
+    interval_seconds: u64,
+) -> Result<(), Error> {
+    println!("🌍 Advanced Currency Trading Monitor 💱📈");
+    println!("==========================================");
+
+    // Create monitoring configuration
+    let mut config = MonitoringConfig::default();
+    config.monitoring_interval_seconds = interval_seconds;
+
+    // Create and start the currency monitor
+    let mut monitor = CurrencyMonitor::new(initial_amount, initial_currency, llm, Some(config))?;
+
+    // Set up signal handler for graceful shutdown
+    println!("💡 Press Ctrl+C to stop monitoring and view final portfolio summary");
+
+    // Handle Ctrl+C gracefully
+    let monitor_handle = tokio::spawn(async move { monitor.start_monitoring().await });
+
+    // Wait for Ctrl+C
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => {
+            println!("\n🛑 Shutdown signal received. Stopping monitor...");
+        }
+        Err(err) => {
+            eprintln!("Unable to listen for shutdown signal: {}", err);
         }
     }
 
+    // The monitor will stop when the handle is dropped
+    monitor_handle.abort();
+
+    println!("✅ Currency monitor stopped successfully.");
     Ok(())
 }
